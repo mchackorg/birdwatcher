@@ -2,119 +2,133 @@ package main
 
 import (
 	"flag"
-	"fmt"
-	"io/ioutil"
 	"log"
-	"log/syslog"
 	"net/http"
-	"os"
-	"regexp"
+	"strings"
+
+	"github.com/ecix/birdwatcher/bird"
+	"github.com/ecix/birdwatcher/endpoints"
 
 	"github.com/julienschmidt/httprouter"
-	yaml "gopkg.in/yaml.v2"
 )
 
-var debug int = 0
-var slog *syslog.Writer // Our syslog connection
-var conf *Config
+//go:generate versionize
+var VERSION = "1.7.11"
 
-type Match struct {
-	Expr   string   // The regular expression as a string.
-	Fields []string // The named fields for grouped expressions.
-	Next   string   // The next regular expression in the flow.
-	Action string   // What to do with the stored fields: "store" or "send".
-}
-
-// Compiled regular expression and it's corresponding match data.
-type RE struct {
-	RE    *regexp.Regexp
-	Match Match
-}
-
-// The configuration found in the configuration file.
-type FileConfig struct {
-	Matches  map[string]Match // All our regular expressions and related data.
-	Listen   string           // Listen to this address:port for HTTP.
-	FileName string           // File to look for patterns
-
-}
-
-type Config struct {
-	Conf FileConfig
-	Res  map[string]RE
-}
-
-// Parse the configuration file. Returns the configuration.
-func parseconfig(filename string) (conf *Config, err error) {
-	conf = new(Config)
-
-	contents, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return
-	}
-
-	if err = yaml.Unmarshal(contents, &conf.Conf); err != nil {
-		return
-	}
-
-	conf.Res = make(map[string]RE)
-
-	// Build the regexps from the configuration.
-	for key, match := range conf.Conf.Matches {
-		var err error
-		var re RE
-
-		re.Match = match
-		re.RE, err = regexp.Compile(match.Expr)
-		if err != nil {
-			slog.Err("Couldn't compile re: " + match.Expr)
-			os.Exit(-1)
+func isModuleEnabled(module string, modulesEnabled []string) bool {
+	for _, enabled := range modulesEnabled {
+		if enabled == module {
+			return true
 		}
+	}
+	return false
+}
 
-		// Check that the number of capturing groups matches the number of expected fields.
-		lengroups := len(re.RE.SubexpNames()) - 1
-		lenfields := len(re.Match.Fields)
+func makeRouter(config endpoints.ServerConfig) *httprouter.Router {
+	whitelist := config.ModulesEnabled
 
-		if lengroups != lenfields {
-			line := fmt.Sprintf("Number of capturing groups (%v) not equal to number of fields (%v): %s", lengroups, lenfields, re.Match.Expr)
-			slog.Err(line)
-			os.Exit(-1)
-		}
+	r := httprouter.New()
+	if isModuleEnabled("status", whitelist) {
+		r.GET("/version", endpoints.Version(VERSION))
+		r.GET("/status", endpoints.Endpoint(endpoints.Status))
+	}
+	if isModuleEnabled("protocols", whitelist) {
+		r.GET("/protocols", endpoints.Endpoint(endpoints.Protocols))
+	}
+	if isModuleEnabled("protocols_bgp", whitelist) {
+		r.GET("/protocols/bgp", endpoints.Endpoint(endpoints.Bgp))
+	}
+	if isModuleEnabled("symbols", whitelist) {
+		r.GET("/symbols", endpoints.Endpoint(endpoints.Symbols))
+	}
+	if isModuleEnabled("symbols_tables", whitelist) {
+		r.GET("/symbols/tables", endpoints.Endpoint(endpoints.SymbolTables))
+	}
+	if isModuleEnabled("symbols_protocols", whitelist) {
+		r.GET("/symbols/protocols", endpoints.Endpoint(endpoints.SymbolProtocols))
+	}
+	if isModuleEnabled("routes_protocol", whitelist) {
+		r.GET("/routes/protocol/:protocol", endpoints.Endpoint(endpoints.ProtoRoutes))
+	}
+	if isModuleEnabled("routes_table", whitelist) {
+		r.GET("/routes/table/:table", endpoints.Endpoint(endpoints.TableRoutes))
+	}
+	if isModuleEnabled("routes_count_protocol", whitelist) {
+		r.GET("/routes/count/protocol/:protocol", endpoints.Endpoint(endpoints.ProtoCount))
+	}
+	if isModuleEnabled("routes_count_table", whitelist) {
+		r.GET("/routes/count/table/:table", endpoints.Endpoint(endpoints.TableCount))
+	}
+	if isModuleEnabled("routes_filtered", whitelist) {
+		r.GET("/routes/filtered/:protocol", endpoints.Endpoint(endpoints.RoutesFiltered))
+	}
+	if isModuleEnabled("routes_prefixed", whitelist) {
+		r.GET("/routes/prefix", endpoints.Endpoint(endpoints.RoutesPrefixed))
+	}
+	if isModuleEnabled("route_net", whitelist) {
+		r.GET("/route/net/:net", endpoints.Endpoint(endpoints.RouteNet))
+		r.GET("/route/net/:net/table/:table", endpoints.Endpoint(endpoints.RouteNetTable))
+	}
+	if isModuleEnabled("routes_peer", whitelist) {
+		r.GET("/routes/peer", endpoints.Endpoint(endpoints.RoutesPeer))
+	}
+	return r
+}
 
-		conf.Res[key] = re
+// Print service information like, listen address,
+// access restrictions and configuration flags
+func PrintServiceInfo(conf *Config, birdConf bird.BirdConfig) {
+	// General Info
+	log.Println("Starting Birdwatcher")
+	log.Println("            Using:", birdConf.BirdCmd)
+	log.Println("           Listen:", birdConf.Listen)
+
+	// Endpoint Info
+	if len(conf.Server.AllowFrom) == 0 {
+		log.Println("        AllowFrom: ALL")
+	} else {
+		log.Println("        AllowFrom:", strings.Join(conf.Server.AllowFrom, ", "))
 	}
 
-	return
+	log.Println("   ModulesEnabled:")
+	for _, m := range conf.Server.ModulesEnabled {
+		log.Println("       -", m)
+	}
 }
 
 func main() {
-	var configfile = flag.String("config", "birdwatcher.yaml", "Path to configuration file")
-	var flagdebug = flag.Int("debug", 0, "Be more verbose")
+	bird6 := flag.Bool("6", false, "Use bird6 instead of bird")
 	flag.Parse()
 
-	debug = *flagdebug
+	endpoints.VERSION = VERSION
+	bird.InstallRateLimitReset()
+	// Load configurations
+	conf, err := LoadConfigs([]string{
+		"./etc/ecix/birdwatcher.conf",
+		"/etc/ecix/birdwatcher.conf",
+		"./etc/ecix/birdwatcher.local.conf",
+	})
 
-	slog, err := syslog.New(syslog.LOG_ERR, "birdwatcher")
 	if err != nil {
-		fmt.Printf("Couldn't open syslog")
-		os.Exit(-1)
+		log.Fatal("Loading birdwatcher configuration failed:", err)
 	}
 
-	slog.Debug("birdwatcher starting")
-
-	config, err := parseconfig(*configfile)
-	if err != nil {
-		slog.Err("Couldn't parse configuration file: " + err.Error())
-		os.Exit(-1)
+	// Get config according to flags
+	birdConf := conf.Bird
+	if *bird6 {
+		birdConf = conf.Bird6
 	}
-	conf = config
 
-	fmt.Printf("%v\n", conf)
+	PrintServiceInfo(conf, birdConf)
 
-	r := httprouter.New()
-	r.GET("/status", Status)
-	r.GET("/routes", Routes)
-	r.GET("/protocols", Protocols)
+	// Configuration
+	bird.ClientConf = birdConf
+	bird.StatusConf = conf.Status
+	bird.RateLimitConf.Conf = conf.Ratelimit
+	bird.ParserConf = conf.Parser
+	endpoints.Conf = conf.Server
 
-	log.Fatal(http.ListenAndServe(":8080", r))
+	// Make server
+	r := makeRouter(conf.Server)
+	log.Fatal(http.ListenAndServe(birdConf.Listen, r))
 }

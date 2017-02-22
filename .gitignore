@@ -1,0 +1,9 @@
+*.swp
+*.swo
+
+birdwatcher
+birdwatcher-*
+
+DIST/
+
+*.local.*

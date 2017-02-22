@@ -1,4 +1,4 @@
-package main
+package endpoints
 
 type TimeInfo struct {
 	Date         string `json:"date"`
@@ -17,12 +17,14 @@ type APIInfo struct {
 	CacheStatus     CacheStatus `json:"cache_status"`
 }
 
-func GetApiInfo() *APIInfo {
+// go generate does not work in subdirectories. Beautious.
+var VERSION string
+
+func GetApiInfo(from_cache bool) *APIInfo {
 	ai := &APIInfo{}
 
-	/* Dummy data until we implement caching */
-	ai.Version = "1.0"
-	ai.ResultFromCache = false
+	ai.Version = VERSION
+	ai.ResultFromCache = from_cache
 
 	return ai
 }
